@@ -17,7 +17,6 @@
 
 pub mod adaptive_sizer;
 pub mod anchor_selector;
-#[cfg(feature = "code")]
 pub mod code_compressor;
 pub mod content_detector;
 pub mod detection;
@@ -37,7 +36,6 @@ pub mod tag_protector;
 pub mod text_crusher;
 pub mod unidiff_detector;
 
-#[cfg(feature = "code")]
 pub use code_compressor::{
     detect_language, CodeAwareCompressor, CodeCompressionResult, CodeCompressorConfig,
     CodeLanguage, DocstringMode,
@@ -55,10 +53,10 @@ pub use kompress::{
     DEFAULT_TOKENIZER_REPO,
 };
 pub use live_zone::{
-    compress_anthropic_live_zone, compress_openai_chat_live_zone,
+    compress_anthropic_live_zone, compress_block_auto, compress_openai_chat_live_zone,
     compress_openai_responses_live_zone, summarize_openai_responses_no_change_reason, AuthMode,
-    BlockAction, BlockOutcome, CompressionManifest, ExclusionReason, LiveZoneError,
-    LiveZoneOutcome,
+    BlockAction, BlockCompression, BlockOutcome, CompressionManifest, ExclusionReason,
+    LiveZoneError, LiveZoneOutcome,
 };
 pub use log_compressor::{
     LogCompressionResult, LogCompressor, LogCompressorConfig, LogCompressorStats, LogFormat,

@@ -109,7 +109,6 @@ use serde_json::value::RawValue;
 use serde_json::Value;
 use thiserror::Error;
 
-#[cfg(feature = "code")]
 use super::code_compressor::{CodeAwareCompressor, CodeCompressorConfig};
 use super::content_detector::{detect_content_type, ContentType};
 use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
@@ -132,7 +131,6 @@ const STRATEGY_SEARCH_COMPRESSOR: &str = "search_compressor";
 /// Strategy tag emitted when DiffCompressor rewrote a unified-diff block.
 const STRATEGY_DIFF_COMPRESSOR: &str = "diff_compressor";
 /// Strategy tag emitted when CodeAwareCompressor rewrote a source-code block.
-#[cfg(feature = "code")]
 const STRATEGY_CODE_COMPRESSOR: &str = "code_compressor";
 /// Strategy tag emitted when Kompress rewrote a plain-text block (also
 /// used by the SourceCode arm's passthrough fallback — see
@@ -585,7 +583,6 @@ fn diff_compressor() -> &'static DiffCompressor {
     INSTANCE.get_or_init(|| DiffCompressor::new(DiffCompressorConfig::default()))
 }
 
-#[cfg(feature = "code")]
 fn code_compressor() -> &'static CodeAwareCompressor {
     static INSTANCE: OnceLock<CodeAwareCompressor> = OnceLock::new();
     INSTANCE.get_or_init(|| CodeAwareCompressor::new(CodeCompressorConfig::default()))
@@ -749,7 +746,6 @@ pub fn warm_live_zone_compressors() -> bool {
     let _ = log_compressor();
     let _ = search_compressor();
     let _ = diff_compressor();
-    #[cfg(feature = "code")]
     let _ = code_compressor();
     warm_kompress_blocking()
 }
@@ -847,12 +843,6 @@ fn disabled_arms() -> &'static HashSet<ContentType> {
             .map(|raw| parse_disabled_arms(&raw.to_string_lossy()))
             .unwrap_or_default()
     })
-}
-
-/// True when `content_type`'s dispatch arm has been disabled via
-/// `HEADROOM_LIVE_ZONE_DISABLE_ARMS`.
-fn arm_disabled(content_type: ContentType) -> bool {
-    disabled_arms().contains(&content_type)
 }
 
 // ─── Public entry point ────────────────────────────────────────────────
@@ -1124,6 +1114,142 @@ pub fn compress_anthropic_live_zone_with_ccr(
 ///    original_tokens` keep the original and tag `RejectedNotSmaller`
 ///    (note: tokens, not bytes, drive the gate).
 /// 4. Otherwise record the replacement and tag `Compressed`.
+/// Per-block compression result — the live-zone dispatcher applied to one
+/// model-visible text block, plus the replacement and CCR key when accepted.
+#[derive(Debug, Clone)]
+pub struct BlockCompression {
+    /// Detected content type for the input text.
+    pub content_type: ContentType,
+    /// Dispatcher decision.
+    pub action: BlockAction,
+    /// Marker-augmented replacement text, present only when `action` is
+    /// [`BlockAction::Compressed`].
+    pub output: Option<String>,
+    /// BLAKE3 CCR key, present only when a store was wired and the
+    /// compression was accepted. The original was stored under it.
+    pub ccr_hash: Option<String>,
+}
+
+/// Compress one model-visible text block through the live-zone dispatcher.
+///
+/// This is the same decision table the request-level live-zone entry points
+/// use: per-content-type byte threshold, content-type dispatch (JSON array,
+/// build output, search results, git diff, source code, plain text),
+/// tokenizer-validated rejection, and CCR marker injection. It exists for
+/// hosts that compress individual tool-result strings instead of provider
+/// request bodies.
+///
+/// Unlike the request paths, this function deliberately does **not** consult
+/// `HEADROOM_LIVE_ZONE_DISABLE_ARMS`: a caller using the block API gets
+/// unconditional dispatch. It never panics; a compressor error is reported
+/// in [`BlockAction::CompressorError`] and the original bytes are kept.
+#[must_use]
+pub fn compress_block_auto(
+    content_text: &str,
+    tokenizer: &dyn crate::tokenizer::Tokenizer,
+    ccr_store: Option<&dyn CcrStore>,
+) -> BlockCompression {
+    let content_type = detect_content_type(content_text).content_type;
+    let (action, output, ccr_hash) = compress_block_parts(
+        content_text,
+        content_type,
+        tokenizer,
+        ccr_store,
+        &HashSet::new(),
+    );
+    BlockCompression {
+        content_type,
+        action,
+        output,
+        ccr_hash,
+    }
+}
+
+/// Shared implementation behind [`compress_block_auto`] and
+/// [`compress_one_block`]. Returns `(action, replacement, ccr_hash)`;
+/// `replacement` is present only when the compression was accepted, and the
+/// original is stored in `ccr_store` before returning in that case.
+fn compress_block_parts(
+    content_text: &str,
+    content_type: ContentType,
+    tokenizer: &dyn crate::tokenizer::Tokenizer,
+    ccr_store: Option<&dyn CcrStore>,
+    disabled: &HashSet<ContentType>,
+) -> (BlockAction, Option<String>, Option<String>) {
+    // 1. Byte-threshold gate. Empty content always falls through to
+    //    `dispatch_compressor_with` (which short-circuits on empty), so
+    //    only check when the slot has real bytes.
+    if !content_text.is_empty() && content_text.len() < threshold_for(content_type) {
+        return (
+            BlockAction::BelowByteThreshold {
+                content_type: content_type.as_str(),
+                byte_count: content_text.len(),
+                threshold_bytes: threshold_for(content_type),
+            },
+            None,
+            None,
+        );
+    }
+
+    match dispatch_compressor(content_text, content_type, disabled) {
+        DispatchResult::NoOp { content_type } => (
+            BlockAction::NoCompressionApplied {
+                content_type: content_type.to_string(),
+            },
+            None,
+            None,
+        ),
+        DispatchResult::Compressed {
+            strategy,
+            compressed,
+        } => {
+            let original_bytes = content_text.len();
+            // When a CCR store is wired, persist the original block content
+            // keyed by `BLAKE3(original)[..24]` and append the
+            // `<<ccr:HASH>>` marker to the compressed string. The token
+            // gate below is computed against the marker-augmented string so
+            // the saved-token check stays honest.
+            let (compressed_for_replacement, ccr_hash_emitted) =
+                maybe_inject_ccr_marker(content_text, &compressed, ccr_store);
+            let compressed_bytes = compressed_for_replacement.len();
+            let original_tokens = tokenizer.count_text(content_text);
+            let compressed_tokens = tokenizer.count_text(&compressed_for_replacement);
+            if compressed_tokens >= original_tokens {
+                return (
+                    BlockAction::RejectedNotSmaller {
+                        strategy,
+                        original_bytes,
+                        compressed_bytes,
+                        original_tokens,
+                        compressed_tokens,
+                    },
+                    None,
+                    None,
+                );
+            }
+            // Persist only after the rejection gate admits the compression.
+            if let (Some(store), Some(hash)) = (ccr_store, ccr_hash_emitted.as_deref()) {
+                store.put(hash, content_text);
+            }
+            (
+                BlockAction::Compressed {
+                    strategy,
+                    original_bytes,
+                    compressed_bytes,
+                    original_tokens,
+                    compressed_tokens,
+                },
+                Some(compressed_for_replacement),
+                ccr_hash_emitted,
+            )
+        }
+        DispatchResult::Error { strategy, error } => {
+            (BlockAction::CompressorError { strategy, error }, None, None)
+        }
+    }
+}
+
+/// Compress one block and record an accepted replacement into `replacements`.
 #[allow(clippy::too_many_arguments)]
 fn compress_one_block(
     content_text: &str,
@@ -1136,110 +1262,26 @@ fn compress_one_block(
     replacements: &mut Vec<Replacement>,
     ccr_store: Option<&dyn CcrStore>,
 ) -> BlockOutcome {
-    // 1. Byte-threshold gate. Empty content always falls through to
-    //    `dispatch_compressor` (which short-circuits on empty), so
-    //    only check when the slot has real bytes — this preserves
-    //    the existing "tool_result with no inner content" pathway.
-    if !content_text.is_empty() && content_text.len() < threshold_for(content_type) {
-        return BlockOutcome {
-            message_index,
-            block_index,
-            block_type,
-            action: BlockAction::BelowByteThreshold {
-                content_type: content_type.as_str(),
-                byte_count: content_text.len(),
-                threshold_bytes: threshold_for(content_type),
-            },
-        };
+    let (action, accepted, _ccr_hash) = compress_block_parts(
+        content_text,
+        content_type,
+        tokenizer,
+        ccr_store,
+        disabled_arms(),
+    );
+    if let Some(compressed_for_replacement) = accepted {
+        let replacement_bytes = serde_json::to_vec(&compressed_for_replacement)
+            .expect("string is always JSON-encodable");
+        replacements.push(Replacement {
+            range: content_byte_range,
+            replacement: replacement_bytes,
+        });
     }
-
-    match dispatch_compressor(content_text, content_type) {
-        DispatchResult::NoOp { content_type } => BlockOutcome {
-            message_index,
-            block_index,
-            block_type,
-            action: BlockAction::NoCompressionApplied {
-                content_type: content_type.to_string(),
-            },
-        },
-        DispatchResult::Compressed {
-            strategy,
-            compressed,
-        } => {
-            let original_bytes = content_text.len();
-            // PR-B7: when a CCR store is wired, persist the original
-            // block content keyed by `BLAKE3(original)[..24]` and append
-            // the `<<ccr:HASH>>` marker to the compressed string. The
-            // marker stays on a fresh trailing line so it is easy for
-            // the model to spot and so that the per-content-type
-            // compressors (which already produce trailing summary
-            // lines) keep their final newline before the marker.
-            //
-            // The token-validation gate (step 3) is computed against
-            // the marker-augmented string so the saved-token check
-            // stays honest — the marker costs ~6 tokens and we'd
-            // rather forward the original than ship a bigger payload
-            // for a 5-byte block.
-            let (compressed_for_replacement, ccr_hash_emitted) =
-                maybe_inject_ccr_marker(content_text, &compressed, ccr_store);
-            let compressed_bytes = compressed_for_replacement.len();
-            // 3. Tokenizer-validated rejection. Per PR-B4 spec we
-            //    count both the original and compressed strings
-            //    using the model's tokenizer; the compression is
-            //    accepted only when it shrinks the token count.
-            //    Bytes-shrinking-but-tokens-growing happens for
-            //    pathological inputs (e.g. dense base64 → tokenizer
-            //    fragments more aggressively after a transform).
-            let original_tokens = tokenizer.count_text(content_text);
-            let compressed_tokens = tokenizer.count_text(&compressed_for_replacement);
-            if compressed_tokens >= original_tokens {
-                BlockOutcome {
-                    message_index,
-                    block_index,
-                    block_type,
-                    action: BlockAction::RejectedNotSmaller {
-                        strategy,
-                        original_bytes,
-                        compressed_bytes,
-                        original_tokens,
-                        compressed_tokens,
-                    },
-                }
-            } else {
-                // Only persist to the CCR store once the rejection
-                // gate has admitted the compression — otherwise we
-                // populate the store with hashes whose markers
-                // never reach the wire (still correct, but wastes
-                // storage capacity).
-                if let (Some(store), Some(hash)) = (ccr_store, ccr_hash_emitted.as_deref()) {
-                    store.put(hash, content_text);
-                }
-                let replacement_bytes = serde_json::to_vec(&compressed_for_replacement)
-                    .expect("string is always JSON-encodable");
-                replacements.push(Replacement {
-                    range: content_byte_range,
-                    replacement: replacement_bytes,
-                });
-                BlockOutcome {
-                    message_index,
-                    block_index,
-                    block_type,
-                    action: BlockAction::Compressed {
-                        strategy,
-                        original_bytes,
-                        compressed_bytes,
-                        original_tokens,
-                        compressed_tokens,
-                    },
-                }
-            }
-        }
-        DispatchResult::Error { strategy, error } => BlockOutcome {
-            message_index,
-            block_index,
-            block_type,
-            action: BlockAction::CompressorError { strategy, error },
-        },
+    BlockOutcome {
+        message_index,
+        block_index,
+        block_type,
+        action,
     }
 }
 
@@ -1638,7 +1680,14 @@ enum DispatchResult {
 /// Any arm whose content type is named in
 /// `HEADROOM_LIVE_ZONE_DISABLE_ARMS` short-circuits to a no-op before
 /// the table below is consulted.
-fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult {
+/// Dispatch `text` for `content_type`, honoring `disabled` (the
+/// `HEADROOM_LIVE_ZONE_DISABLE_ARMS` set, or empty for unconditional
+/// dispatch).
+fn dispatch_compressor(
+    text: &str,
+    content_type: ContentType,
+    disabled: &HashSet<ContentType>,
+) -> DispatchResult {
     if text.is_empty() {
         return DispatchResult::NoOp {
             content_type: content_type.as_str(),
@@ -1649,7 +1698,7 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
     // operator naming any content type gets that arm disabled, instead
     // of the switch silently covering only the two arms whose bodies
     // happened to consult it.
-    if arm_disabled(content_type) {
+    if disabled.contains(&content_type) {
         return DispatchResult::NoOp {
             content_type: content_type.as_str(),
         };
@@ -1708,17 +1757,15 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
                 compressed: result.compressed,
             }
         }
-        // Routes to the tree-sitter-backed CodeAwareCompressor (PR-B4) when
-        // the `code` feature is compiled in. The compressor fails open
-        // internally (re-parse-and-revert on syntax errors, a min-token
-        // floor, and a compression-ratio guard), so this arm only has to
-        // compare its output against the input; the tokenizer-rejection
-        // gate in `compress_one_block` applies on top of that. When the
-        // code compressor doesn't shrink the block (e.g. it's already
-        // dense, or tree-sitter reverted on a parse error), fall back to
-        // Kompress rather than giving up — mirrors the Python router's
-        // no-shrink → Kompress fallback.
-        #[cfg(feature = "code")]
+        // Routes to the tree-sitter-backed CodeAwareCompressor (PR-B4).
+        // The compressor fails open internally (re-parse-and-revert on
+        // syntax errors, a min-token floor, and a compression-ratio guard),
+        // so this arm only has to compare its output against the input; the
+        // tokenizer-rejection gate in `compress_one_block` applies on top of
+        // that. When the code compressor doesn't shrink the block (e.g.
+        // it's already dense, or tree-sitter reverted on a parse error),
+        // fall back to Kompress rather than giving up — mirrors the Python
+        // router's no-shrink → Kompress fallback.
         ContentType::SourceCode => {
             let result = code_compressor().compress(text);
             if result.compressed == text {
@@ -1735,10 +1782,6 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
                 compressed: result.compressed,
             }
         }
-        // Without the `code` feature there is no AST compressor; use the
-        // same Kompress/no-op fallback as the passthrough path above.
-        #[cfg(not(feature = "code"))]
-        ContentType::SourceCode => kompress_or_noop(text, content_type),
         // Cache-only EXTRACTIVE prose compressor (PR-B4): Kompress drops
         // low-salience words and rejoins on single spaces — lossy by
         // design. `kompress_or_noop` degrades to a deterministic no-op
@@ -3316,5 +3359,72 @@ mod openai_responses_tests {
             summarize_openai_responses_no_change_reason(&manifest),
             "below_output_floor"
         );
+    }
+}
+
+#[cfg(test)]
+mod block_compression_tests {
+    use super::*;
+    use crate::ccr::InMemoryCcrStore;
+    use crate::tokenizer::EstimatingCounter;
+
+    /// A Python module large enough to clear the SourceCode byte threshold
+    /// and worth compressing.
+    fn python_source() -> String {
+        let mut out = String::from("import os\n\n");
+        for i in 0..40 {
+            out.push_str(&format!(
+                "def process_{i}(items):\n    \"\"\"Process a batch of items.\"\"\"\n    results = []\n    for item in items:\n        if not item:\n            continue\n        results.append(item.strip().lower())\n    return results\n\n"
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn source_code_compresses_and_stores_the_original() {
+        let store = InMemoryCcrStore::new();
+        let tokenizer = EstimatingCounter::default();
+        let original = python_source();
+        let out = compress_block_auto(&original, &tokenizer, Some(&store));
+
+        assert_eq!(out.content_type, ContentType::SourceCode);
+        assert!(
+            matches!(
+                out.action,
+                BlockAction::Compressed {
+                    strategy: "code_compressor",
+                    ..
+                }
+            ),
+            "unexpected action: {:?}",
+            out.action
+        );
+        let compressed = out.output.expect("accepted compression");
+        assert!(compressed.len() < original.len());
+        let hash = out.ccr_hash.expect("CCR marker hash");
+        assert!(compressed.contains(&format!("<<ccr:{hash}>>")));
+        assert_eq!(store.get(&hash).as_deref(), Some(original.as_str()));
+    }
+
+    #[test]
+    fn empty_block_is_a_noop() {
+        let out = compress_block_auto("", &EstimatingCounter::default(), None);
+        assert!(matches!(
+            out.action,
+            BlockAction::NoCompressionApplied { .. }
+        ));
+        assert!(out.output.is_none());
+        assert!(out.ccr_hash.is_none());
+    }
+
+    #[test]
+    fn small_source_code_is_below_the_byte_threshold() {
+        let out = compress_block_auto(
+            "fn main() { println!(\"hi\"); }\n",
+            &EstimatingCounter::default(),
+            None,
+        );
+        assert!(matches!(out.action, BlockAction::BelowByteThreshold { .. }));
+        assert!(out.output.is_none());
     }
 }
