@@ -193,4 +193,21 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&r.output).unwrap();
         assert_eq!(v["msg"], "héllo 🌍 wörld");
     }
+    #[test]
+    fn whitespace_inside_strings_is_preserved() {
+        let pretty = "{\n  \"msg\": \"hello  world\\n\",\n  \"n\": 1\n}";
+        let r = JsonMinifier.apply(pretty).expect("parses");
+        assert_eq!(r.output, "{\"msg\":\"hello  world\\n\",\"n\":1}");
+    }
+
+    /// Without `arbitrary-precision`, a `Value` round-trip would turn
+    /// `18446744073709551617` into an `f64` and round it. The lossless
+    /// lexical pass must keep the literal token.
+    #[cfg(not(feature = "arbitrary-precision"))]
+    #[test]
+    fn numeric_tokens_survive_without_arbitrary_precision() {
+        let pretty = "{ \"id\": 18446744073709551617, \"f\": 1.0, \"e\": 1e2 }";
+        let r = JsonMinifier.apply(pretty).expect("parses");
+        assert_eq!(r.output, r#"{"id":18446744073709551617,"f":1.0,"e":1e2}"#);
+    }
 }
