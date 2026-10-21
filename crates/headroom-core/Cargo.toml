@@ -225,6 +225,14 @@ proptest = "1"
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 
+# The Kompress parity fixtures import `transforms::kompress`, which only exists
+# with the `ml` feature. Gate the target so `--no-default-features --tests`
+# builds the remaining integration tests without it.
+[[test]]
+name = "kompress_parity"
+path = "tests/kompress_parity.rs"
+required-features = ["ml"]
+
 [[bench]]
 name = "tokenizer"
 harness = false
