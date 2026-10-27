@@ -74,8 +74,12 @@ impl ReformatTransform for JsonMinifier {
 /// Only whitespace outside string literals is removed, so numeric tokens,
 /// escapes, key order, and duplicate keys survive the pass byte-for-byte.
 /// The caller has already validated the input with `serde_json`.
+///
+/// `pub(crate)` so `SmartCrusher`'s unchanged-document path can reuse the
+/// same lexical pass instead of re-serializing through a precision-limited
+/// `Value` (see `smart_crusher::crusher`).
 #[cfg(not(feature = "arbitrary-precision"))]
-fn minify_lossless(input: &str) -> String {
+pub(crate) fn minify_lossless(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut in_string = false;
     let mut escaped = false;

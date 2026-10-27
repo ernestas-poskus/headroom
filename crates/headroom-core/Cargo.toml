@@ -233,6 +233,16 @@ name = "kompress_parity"
 path = "tests/kompress_parity.rs"
 required-features = ["ml"]
 
+# The code-compressor parity fixtures import `transforms::code_compressor`,
+# which only exists when the `code` feature is enabled (it pulls in the
+# tree-sitter grammar crates). Gate the target the same way so
+# `--no-default-features --tests` builds the remaining integration tests
+# without it.
+[[test]]
+name = "code_compressor_parity"
+path = "tests/code_compressor_parity.rs"
+required-features = ["code"]
+
 [[bench]]
 name = "tokenizer"
 harness = false

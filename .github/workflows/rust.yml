@@ -160,7 +160,13 @@ jobs:
           - arbitrary-precision
           - ml
           - redis
+          # `code` is an optional capability too (tree-sitter grammars), so
+          # qualify it on its own as well as in combination with the other
+          # non-`ml` optional features.
+          - code
           - 'sqlite,arbitrary-precision'
+          - 'code,arbitrary-precision'
+          - 'sqlite,code,arbitrary-precision'
     steps:
       - uses: actions/checkout@v7
       - name: Install stable toolchain
